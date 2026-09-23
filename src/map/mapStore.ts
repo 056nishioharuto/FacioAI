@@ -14,17 +14,18 @@ interface MapState {
   session: MeetingSession | null;
   debugLog: DebugEntry[];
   selectedNodeId: string | null;
-  recentlyUpdatedNodeId: string | null; // UPDATEアニメーション用
+  recentlyUpdatedNodeId: string | null;
+  focusNodeId: string | null;
   isT1Loading: boolean;
   isT2Loading: boolean;
   isConsolidating: boolean;
 
-  // --- アクション ---
   initSession: (theme: string) => void;
-  addUtterance: (text: string) => string; // utterance IDを返す
+  addUtterance: (text: string, source?: 'text' | 'speech') => string;
   markUtteranceProcessed: (id: string) => void;
   applyT1: (utteranceText: string, action: T1ResponseValidated) => void;
   clearRecentlyUpdated: () => void;
+  clearFocusNode: () => void;
   applyT2: (response: T2ResponseValidated) => void;
   applyConsolidation: (response: T2ResponseValidated) => void;
   setStatus: (status: MeetingSession['status']) => void;
@@ -45,11 +46,11 @@ export const useMapStore = create<MapState>((set, get) => ({
   debugLog: [],
   selectedNodeId: null,
   recentlyUpdatedNodeId: null,
+  focusNodeId: null,
   isT1Loading: false,
   isT2Loading: false,
   isConsolidating: false,
 
-  // ---- 会議セッション初期化 ----
   initSession: (theme: string) => {
     set({
       session: {
@@ -67,18 +68,14 @@ export const useMapStore = create<MapState>((set, get) => ({
     });
   },
 
-  // ---- 発言追加 ----
-  addUtterance: (text: string) => {
+  addUtterance: (text: string, source?: 'text' | 'speech') => {
     const id = nanoid();
     set((state) => {
       if (!state.session) return state;
       return {
         session: {
           ...state.session,
-          utterances: [
-            ...state.session.utterances,
-            { id, text, timestamp: Date.now(), processed: false },
-          ],
+          utterances: [...state.session.utterances, { id, text, timestamp: Date.now(), processed: false, source }],
         },
       };
     });
@@ -91,69 +88,51 @@ export const useMapStore = create<MapState>((set, get) => ({
       return {
         session: {
           ...state.session,
-          utterances: state.session.utterances.map((u) =>
-            u.id === id ? { ...u, processed: true } : u
-          ),
+          utterances: state.session.utterances.map((u) => u.id === id ? { ...u, processed: true } : u),
           utteranceCount: state.session.utteranceCount + 1,
         },
       };
     });
   },
 
-  // ---- T1アクション適用 ----
   applyT1: (utteranceText: string, action: T1ResponseValidated) => {
     set((state) => {
       if (!state.session) return state;
-      const { nodes, updatedId } = applyT1Action(state.session.nodes, action, utteranceText);
+      const { nodes, createdId, updatedId } = applyT1Action(state.session.nodes, action, utteranceText);
       const validatedNodes = validateTree(nodes);
+      const focusTarget = createdId ?? updatedId ?? null;
       return {
         session: { ...state.session, nodes: validatedNodes },
         recentlyUpdatedNodeId: updatedId ?? state.recentlyUpdatedNodeId,
+        focusNodeId: focusTarget,
       };
     });
-    // UPDATEの場合、2秒後にハイライトをクリア
     if (action.action === 'UPDATE') {
-      setTimeout(() => {
-        set({ recentlyUpdatedNodeId: null });
-      }, 2000);
+      setTimeout(() => { set({ recentlyUpdatedNodeId: null }); }, 2000);
     }
   },
 
   clearRecentlyUpdated: () => set({ recentlyUpdatedNodeId: null }),
+  clearFocusNode: () => set({ focusNodeId: null }),
 
-  // ---- T2操作適用 ----
   applyT2: (response: T2ResponseValidated) => {
     set((state) => {
       if (!state.session) return state;
       const nodes = applyT2Operations(state.session.nodes, response);
-      const validatedNodes = validateTree(nodes);
-      return {
-        session: { ...state.session, nodes: validatedNodes },
-      };
+      return { session: { ...state.session, nodes: validateTree(nodes) } };
     });
   },
 
-  // ---- Consolidation適用（T2と同じ操作セット）----
   applyConsolidation: (response: T2ResponseValidated) => {
     set((state) => {
       if (!state.session) return state;
       const nodes = applyT2Operations(state.session.nodes, response);
-      const validatedNodes = validateTree(nodes);
-      return {
-        session: {
-          ...state.session,
-          nodes: validatedNodes,
-          status: 'done',
-        },
-      };
+      return { session: { ...state.session, nodes: validateTree(nodes), status: 'done' } };
     });
   },
 
   setStatus: (status) => {
-    set((state) => {
-      if (!state.session) return state;
-      return { session: { ...state.session, status } };
-    });
+    set((state) => { if (!state.session) return state; return { session: { ...state.session, status } }; });
   },
 
   setSelectedNode: (id) => set({ selectedNodeId: id }),
@@ -163,82 +142,49 @@ export const useMapStore = create<MapState>((set, get) => ({
 
   addDebugEntry: (entry) => {
     const full: DebugEntry = { ...entry, id: nanoid(), timestamp: Date.now() };
-    set((state) => ({
-      debugLog: [full, ...state.debugLog].slice(0, 50), // 最新50件
-    }));
+    set((state) => ({ debugLog: [full, ...state.debugLog].slice(0, 50) }));
   },
 
-  // ---- 手動ノード追加 ----
   manualAddNode: (label, type, parentId) => {
     const id = `node_${nanoid(8)}`;
     const now = Date.now();
     set((state) => {
       if (!state.session) return state;
       const newNode: MapNode = {
-        id,
-        label,
-        type,
+        id, label, type,
         parentId: parentId && state.session.nodes[parentId] ? parentId : null,
-        relation: null,
-        summary: label,
-        insights: [],
-        sourceUtterance: '(手動追加)',
-        confidence: 1.0,
-        createdAt: now,
-        updatedAt: now,
-        position: { x: 0, y: 0 },
+        relation: null, summary: label, insights: [],
+        sourceUtterance: '(手動追加)', confidence: 1.0,
+        createdAt: now, updatedAt: now, position: { x: 0, y: 0 },
       };
-      return {
-        session: {
-          ...state.session,
-          nodes: { ...state.session.nodes, [id]: newNode },
-        },
-      };
+      return { session: { ...state.session, nodes: { ...state.session.nodes, [id]: newNode } } };
     });
   },
 
-  // ---- ノード削除 ----
   deleteNode: (id) => {
     set((state) => {
       if (!state.session) return state;
       const nodes = { ...state.session.nodes };
-      // 子ノードを親に繋ぎ替え
       const node = nodes[id];
       if (node) {
         for (const n of Object.values(nodes)) {
-          if (n.parentId === id) {
-            nodes[n.id] = { ...n, parentId: node.parentId };
-          }
+          if (n.parentId === id) nodes[n.id] = { ...n, parentId: node.parentId };
         }
         delete nodes[id];
       }
-      return {
-        session: { ...state.session, nodes },
-        selectedNodeId: state.selectedNodeId === id ? null : state.selectedNodeId,
-      };
+      return { session: { ...state.session, nodes }, selectedNodeId: state.selectedNodeId === id ? null : state.selectedNodeId };
     });
   },
 
-  // ---- ドラッグ後の位置更新 ----
   updateNodePosition: (id, position) => {
     set((state) => {
       if (!state.session) return state;
       const node = state.session.nodes[id];
       if (!node) return state;
-      return {
-        session: {
-          ...state.session,
-          nodes: {
-            ...state.session.nodes,
-            [id]: { ...node, position },
-          },
-        },
-      };
+      return { session: { ...state.session, nodes: { ...state.session.nodes, [id]: { ...node, position } } } };
     });
   },
 
-  // ---- T2トリガー判定 ----
-  // 将来：発言数 + マップ複雑度などの複合条件に拡張可能
   shouldRunT2: () => {
     const { session } = get();
     if (!session) return false;
@@ -247,6 +193,6 @@ export const useMapStore = create<MapState>((set, get) => ({
   },
 
   resetSession: () => {
-    set({ session: null, debugLog: [], selectedNodeId: null });
+    set({ session: null, debugLog: [], selectedNodeId: null, focusNodeId: null });
   },
 }));
